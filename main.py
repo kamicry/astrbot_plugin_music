@@ -80,6 +80,10 @@ class MusicPlugin(Star):
 
         # 搜索歌曲
         songs = await self.api.fetch_data(keyword=song_name)
+        if songs is None:
+            error_message = getattr(self.api, "last_error_message", None) or "网易云音乐服务暂时不可用，请稍后再试~"
+            yield event.plain_result(error_message)
+            return
         if not songs:
             yield event.plain_result("没能找到这首歌喵~")
             return
@@ -166,12 +170,22 @@ class MusicPlugin(Star):
         elif (
             platform_name in ["telegram", "lark", "aiocqhttp"] and send_mode == "record"
         ):
-            audio_url = (await self.api.fetch_extra(song_id=song["id"]))["audio_url"]
+            extra_info = await self.api.fetch_extra(song_id=song["id"])
+            audio_url = extra_info.get("audio_url")
+            if not audio_url:
+                error_message = getattr(self.api, "last_error_message", None) or "未能获取歌曲播放链接，请稍后再试~"
+                await event.send(event.plain_result(error_message))
+                return
             await event.send(event.chain_result([Record.fromURL(audio_url)]))
 
         # 发文字
         else:
-            audio_url = (await self.api.fetch_extra(song_id=song["id"]))["audio_url"]
+            extra_info = await self.api.fetch_extra(song_id=song["id"])
+            audio_url = extra_info.get("audio_url")
+            if not audio_url:
+                error_message = getattr(self.api, "last_error_message", None) or "未能获取歌曲播放链接，请稍后再试~"
+                await event.send(event.plain_result(error_message))
+                return
             song_info_str = (
                 f"🎶{song.get('name')} - {song.get('artists')} {format_time(song['duration'])}\n"
                 f"🔗链接：{audio_url}"
@@ -181,8 +195,11 @@ class MusicPlugin(Star):
         # 发送评论
         if self.enable_comments:
             comments = await self.api.fetch_comments(song_id=song["id"])
-            content = random.choice(comments)["content"]
-            await event.send(event.plain_result(content))
+            if comments:
+                content = random.choice(comments)["content"]
+                await event.send(event.plain_result(content))
+            else:
+                logger.info("未获取到歌曲 %s 的热评", song["id"])
 
         # 发送歌词
         if self.enable_lyrics:

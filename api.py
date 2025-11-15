@@ -90,46 +90,203 @@ class NetEaseMusicAPI:
         }
     async def close(self):
         await self.session.close()
+
+
 class NetEaseMusicAPINodeJs:
     """
     网易云音乐API NodeJs版本
     """
-    def __init__(self, base_url:str):
+
+    def __init__(self, base_url: str):
         # http://netease_cloud_music_api:{port}/
-        self.base_url = base_url
-        self.session = aiohttp.ClientSession(base_url)
+        self.base_url = base_url.rstrip("/")
+        self.session = aiohttp.ClientSession(base_url=self.base_url)
+        self._post_headers = {"Content-Type": "application/json"}
+        self._last_error_message: str | None = None
 
-    async def _request(self, url: str, data: dict = {}, method: str = "GET"):
-        if method.upper() == "POST":
-            async with self.session.post(url, data=data) as response:
-                if response.headers.get("Content-Type") == "application/json":
-                    return await response.json()
-                else:
-                    return json.loads(await response.text())
-        elif method.upper() == "GET":
-            async with self.session.get(url) as response:
-                return await response.json()
+    @property
+    def last_error_message(self) -> str | None:
+        return self._last_error_message
+
+    async def _request(
+        self,
+        url: str,
+        data: dict | None = None,
+        method: str = "GET",
+    ):
+        method = method.upper()
+        self._last_error_message = None
+        payload = data or {}
+        request_kwargs: dict[str, object] = {}
+        headers: dict[str, str] = {}
+
+        if method == "POST":
+            headers.update(self._post_headers)
+            request_kwargs["json"] = payload
+        elif method == "GET" and payload:
+            request_kwargs["params"] = payload
+
+        if headers:
+            request_kwargs["headers"] = headers
+
+        if payload:
+            logger.debug(
+                "NetEase Node API request | %s %s | payload=%s",
+                method,
+                url,
+                payload,
+            )
         else:
-            raise ValueError("不支持的请求方式")
+            logger.debug("NetEase Node API request | %s %s", method, url)
 
+        try:
+            async with self.session.request(method, url, **request_kwargs) as response:
+                status = response.status
+                text = await response.text()
+                body_preview = text[:500].strip()
+                logger.debug(
+                    "NetEase Node API response | %s %s | status=%s | body=%s",
+                    method,
+                    url,
+                    status,
+                    body_preview,
+                )
 
-    async def fetch_data(self, keyword: str, limit=5) -> list[dict]:
+                if status >= 400:
+                    message = f"网易云音乐节点 API 请求失败 (HTTP {status})"
+                    logger.error("%s，响应内容：%s", message, body_preview)
+                    self._last_error_message = message
+                    return {
+                        "success": False,
+                        "message": message,
+                        "status": status,
+                        "raw": text,
+                    }
+
+                if not body_preview:
+                    message = "网易云音乐节点 API 返回空响应"
+                    logger.error(message)
+                    self._last_error_message = message
+                    return {
+                        "success": False,
+                        "message": message,
+                        "status": status,
+                    }
+
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    message = "网易云音乐节点 API 返回无法解析的内容"
+                    logger.error("%s：%s", message, body_preview)
+                    self._last_error_message = message
+                    return {
+                        "success": False,
+                        "message": message,
+                        "status": status,
+                        "raw": text,
+                    }
+
+                if (
+                    isinstance(parsed, dict)
+                    and parsed.get("code") is not None
+                    and parsed.get("code") != 200
+                ):
+                    message = parsed.get("msg") or parsed.get("message") or (
+                        f"网易云音乐节点 API 返回错误码：{parsed.get('code')}"
+                    )
+                    logger.error("%s，响应内容：%s", message, body_preview)
+                    self._last_error_message = message
+                    parsed["success"] = False
+                    parsed["message"] = message
+                    parsed["status"] = parsed.get("code")
+                return parsed
+        except aiohttp.ClientError as exc:
+            message = f"网易云音乐节点 API 请求异常：{exc}"
+            logger.error(message)
+            self._last_error_message = message
+            return {"success": False, "message": message}
+        except Exception as exc:
+            message = f"网易云音乐节点 API 未知错误：{exc}"
+            logger.exception(message)
+            self._last_error_message = message
+            return {"success": False, "message": message}
+
+    async def fetch_data(self, keyword: str, limit=5) -> list[dict] | None:
         """搜索歌曲"""
         url = "/search"
         data = {"keywords": keyword, "limit": limit, "type": 1, "offset": 0}
 
         result = await self._request(url, data=data, method="POST")
-        res = [
-            {
-                "id": song["id"],
-                "name": song["name"],
-                "artists": "、".join(artist["name"] for artist in song["artists"]),
-                "duration": song["duration"],
-            }
-            for song in result["result"]["songs"][:limit]
-        ]
+        if not isinstance(result, dict):
+            message = "网易云音乐服务返回了无法解析的数据，请稍后再试~"
+            logger.error("搜索歌曲失败：响应格式异常")
+            self._last_error_message = message
+            return None
+        if result.get("success") is False:
+            message = result.get("message") or "网易云音乐服务暂时不可用，请稍后再试~"
+            logger.error("搜索歌曲失败：%s", message)
+            self._last_error_message = message
+            return None
+        if result.get("code") is not None and result.get("code") != 200:
+            raw_message = result.get("message") or result.get("msg") or (
+                f"网易云音乐节点 API 返回错误码：{result.get('code')}"
+            )
+            message = f"网易云音乐服务暂时不可用：{raw_message}"
+            logger.error("搜索歌曲失败：%s", raw_message)
+            self._last_error_message = message
+            return None
 
-        return res
+        result_block = result.get("result")
+        if not isinstance(result_block, dict):
+            message = "网易云音乐服务返回数据异常，请稍后再试~"
+            logger.warning("搜索歌曲失败：响应缺少 result 字段")
+            self._last_error_message = message
+            return None
+
+        songs = result_block.get("songs")
+        if not isinstance(songs, list):
+            message = "网易云音乐服务返回数据异常，请稍后再试~"
+            logger.warning("搜索歌曲失败：songs 字段不是列表")
+            self._last_error_message = message
+            return None
+        if not songs:
+            logger.info("关键词 \"%s\" 未找到歌曲", keyword)
+            self._last_error_message = None
+            return []
+
+        parsed_songs: list[dict] = []
+        for song in songs[:limit]:
+            if not isinstance(song, dict):
+                continue
+            song_id = song.get("id")
+            if song_id is None:
+                continue
+            artists_field = song.get("artists") or []
+            if isinstance(artists_field, list):
+                artists = "、".join(
+                    artist.get("name", "未知")
+                    for artist in artists_field
+                    if isinstance(artist, dict)
+                )
+            else:
+                artists = str(artists_field)
+
+            parsed_songs.append(
+                {
+                    "id": song_id,
+                    "name": song.get("name", "未知"),
+                    "artists": artists,
+                    "duration": song.get("duration", 0),
+                }
+            )
+
+        if not parsed_songs:
+            logger.info("关键词 \"%s\" 未找到可用的歌曲数据", keyword)
+            self._last_error_message = None
+            return []
+
+        self._last_error_message = None
+        return parsed_songs
 
     async def fetch_comments(self, song_id: int):
         """获取热评"""
@@ -139,13 +296,53 @@ class NetEaseMusicAPINodeJs:
             "type": 0,
         }
         result = await self._request(url, data=data, method="POST")
-        return result.get("hotComments", [])
+        if not isinstance(result, dict):
+            logger.error("获取热评失败：响应格式异常")
+            return []
+        if result.get("success") is False:
+            logger.error("获取热评失败：%s", result.get("message", "未知错误"))
+            return []
+        if result.get("code") is not None and result.get("code") != 200:
+            message = result.get("message") or result.get("msg") or (
+                f"网易云音乐节点 API 返回错误码：{result.get('code')}"
+            )
+            logger.error("获取热评失败：%s", message)
+            return []
+
+        comments = result.get("hotComments")
+        if not isinstance(comments, list):
+            logger.info("歌曲 %s 没有热评或响应格式不正确", song_id)
+            return []
+        return comments
 
     async def fetch_lyrics(self, song_id):
         """获取歌词"""
         url = f"{self.base_url}/lyric?id={song_id}"
         result = await self._request(url)
-        return result.get("lrc", {}).get("lyric", "歌词未找到")
+        if not isinstance(result, dict):
+            logger.error("获取歌词失败：响应格式异常")
+            return "歌词未找到"
+        if result.get("success") is False:
+            logger.error("获取歌词失败：%s", result.get("message", "未知错误"))
+            return "歌词未找到"
+        if result.get("code") is not None and result.get("code") != 200:
+            message = result.get("message") or result.get("msg") or (
+                f"网易云音乐节点 API 返回错误码：{result.get('code')}"
+            )
+            logger.error("获取歌词失败：%s", message)
+            return "歌词未找到"
+
+        lyrics_block = result.get("lrc", {})
+        if not isinstance(lyrics_block, dict):
+            logger.info("歌曲 %s 未找到歌词", song_id)
+            return "歌词未找到"
+
+        lyric = lyrics_block.get("lyric")
+        if not lyric:
+            logger.info("歌曲 %s 未找到歌词", song_id)
+            return "歌词未找到"
+        return lyric
+
     async def fetch_extra(self, song_id: str | int) -> dict[str, str]:
         """
         获取额外信息
@@ -153,11 +350,47 @@ class NetEaseMusicAPINodeJs:
         url = "/song/url"
         data = {"id": song_id}
         result = await self._request(url, data=data, method="POST")
-        return {
-            "audio_url": result["data"][0].get("url", "")
-        }
+        if not isinstance(result, dict):
+            message = "网易云音乐服务返回了无法解析的数据，请稍后再试~"
+            logger.error("获取歌曲链接失败：响应格式异常")
+            self._last_error_message = message
+            return {"audio_url": ""}
+        if result.get("success") is False:
+            message = result.get("message") or "网易云音乐服务暂时不可用，请稍后再试~"
+            logger.error("获取歌曲链接失败：%s", message)
+            self._last_error_message = message
+            return {"audio_url": ""}
+        if result.get("code") is not None and result.get("code") != 200:
+            raw_message = result.get("message") or result.get("msg") or (
+                f"网易云音乐节点 API 返回错误码：{result.get('code')}"
+            )
+            message = f"网易云音乐服务暂时不可用：{raw_message}"
+            logger.error("获取歌曲链接失败：%s", raw_message)
+            self._last_error_message = message
+            return {"audio_url": ""}
+
+        data_block = result.get("data")
+        if not isinstance(data_block, list) or not data_block:
+            message = "网易云音乐服务未返回播放链接，请稍后再试~"
+            logger.info("歌曲 %s 未返回播放链接", song_id)
+            self._last_error_message = message
+            return {"audio_url": ""}
+
+        first_item = data_block[0] if isinstance(data_block[0], dict) else {}
+        audio_url = first_item.get("url", "") if isinstance(first_item, dict) else ""
+        if not audio_url:
+            message = "网易云音乐服务未返回播放链接，请稍后再试~"
+            logger.info("歌曲 %s 未返回播放链接", song_id)
+            self._last_error_message = message
+            return {"audio_url": ""}
+
+        self._last_error_message = None
+        return {"audio_url": audio_url}
+
     async def close(self):
         await self.session.close()
+
+
 class MusicSearcher:
     """
     用于从指定音乐平台搜索歌曲信息的工具类。
